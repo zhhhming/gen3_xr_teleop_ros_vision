@@ -18,7 +18,7 @@
   <depend>orocos_kdl</depend>
   <depend>trac_ik_lib</depend>
   <depend>tf2_ros</depend>
-  <depend>snesor_msgs</depend>
+  <depend>sensor_msgs</depend>
   <depend>cv_bridge</depend>
 
   <!-- Python XR 发布器 -->

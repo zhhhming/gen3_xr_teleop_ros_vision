@@ -179,6 +179,13 @@ public:
                 last_image_ = msg;
                 last_image_stamp_ = msg->header.stamp;
             });
+        // Digit 触觉传感器图像（只取 raw 帧，不开 GUI）
+        digit_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
+            "/digit/image_raw", rclcpp::SensorDataQoS(),
+            [this](const sensor_msgs::msg::Image::SharedPtr msg){
+            std::lock_guard<std::mutex> lk(digit_image_mutex_);
+            last_digit_image_ = msg;
+            });
 
         // 创建 TF broadcaster
         tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
@@ -1069,6 +1076,10 @@ private:
 
         std::filesystem::create_directories(images_dir_);
 
+        // Digit 图像目录与相机目录并列
+        digit_images_dir_ = run_dir_ + "/digit_images";
+        std::filesystem::create_directories(digit_images_dir_);
+
         // 2) 打开 CSV（带表头）
         const std::string csv_path = run_dir_ + "/joint_gripper_log.csv";
         csv_.open(csv_path, std::ios::out);
@@ -1080,7 +1091,7 @@ private:
 
         csv_ << "timestamp_s";
         for (int i = 0; i < num_joints_; ++i) csv_ << ",joint" << i << "_deg";
-        csv_ << ",gripper_0to1,image_file\n";
+        csv_ << ",gripper_0to1,image_file,digit_image_file\n";
         csv_.flush();
 
         // 3) 50Hz 循环
@@ -1100,6 +1111,7 @@ private:
             }
 
             std::string img_file_rel = "";
+            std::string digit_img_file_rel = "";
             {
                 std::lock_guard<std::mutex> lk(image_mutex_);
                 if (last_image_) {
@@ -1122,10 +1134,30 @@ private:
                 }
             }
 
+            // 保存 Digit 帧（与相机并列目录）
+            {
+            std::lock_guard<std::mutex> lk(digit_image_mutex_);
+            if (last_digit_image_) {
+                const auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                digit_img_file_rel = "digit_images/digit_" + std::to_string(now_us) + ".png";
+                const std::string digit_img_path = run_dir_ + "/" + digit_img_file_rel;
+                try {
+                // 使用原始编码保存（优先保持单通道/彩色一致性）
+                auto cv_ptr = cv_bridge::toCvCopy(*last_digit_image_, last_digit_image_->encoding);
+                cv::imwrite(digit_img_path, cv_ptr->image);
+                } catch (const std::exception& e) {
+                RCLCPP_WARN(this->get_logger(), "Failed to save Digit image: %s", e.what());
+                digit_img_file_rel.clear();
+                }
+            }
+            }
+
+
             // 写一行 CSV
             csv_ << std::fixed << std::setprecision(6) << ts;
             for (float deg : joints_copy) csv_ << "," << deg;
-            csv_ << "," << grip_copy << "," << img_file_rel << "\n";
+            csv_ << "," << grip_copy << "," << img_file_rel << "," << digit_img_file_rel << "\n";
 
             // 定期 flush，避免掉电丢数据
             if (now - last_flush > std::chrono::seconds(1)) {
@@ -1221,6 +1253,14 @@ private:
     sensor_msgs::msg::Image::SharedPtr last_image_;
     rclcpp::Time last_image_stamp_;
     rclcpp::Time last_saved_image_stamp_;
+
+    // ---- Digit 触觉相机图像 ----
+    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr digit_sub_;
+    std::mutex digit_image_mutex_;
+    sensor_msgs::msg::Image::SharedPtr last_digit_image_;
+
+    // 目录：相机与 Digit 并列
+    std::string digit_images_dir_;
 
     // Frame 状态（受 frame_mutex_ 保护）
     std::mutex frame_mutex_;

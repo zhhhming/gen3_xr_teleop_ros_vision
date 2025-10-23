@@ -9,7 +9,7 @@
   <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
-
+0
   <!-- C++ / ROS 依赖 -->
   <depend>rclcpp</depend>
   <depend>std_msgs</depend>

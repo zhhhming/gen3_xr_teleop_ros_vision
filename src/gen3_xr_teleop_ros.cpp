@@ -12,6 +12,7 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <cv_bridge/cv_bridge.h>
 #include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <filesystem>
 
 #include <iostream>
@@ -172,19 +173,35 @@ public:
         button_y_sub_ = this->create_subscription<std_msgs::msg::Bool>(
             "xr/button_y", 10,
             std::bind(&Gen3XRTeleopNode::buttonYCallback, this, std::placeholders::_1));
-        color_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
+        // 相机 1：/camera/color/image_raw
+        color_sub_cam1_ = this->create_subscription<sensor_msgs::msg::Image>(
+            "/camera/color/image_raw", rclcpp::SensorDataQoS(),
+            [this](const sensor_msgs::msg::Image::SharedPtr msg){
+                std::lock_guard<std::mutex> lk(image_cam1_mutex_);
+                last_image_cam1_ = msg;
+            });
+
+        // 相机 2：/camera/camera/color/image_raw
+        color_sub_cam2_ = this->create_subscription<sensor_msgs::msg::Image>(
             "/camera/camera/color/image_raw", rclcpp::SensorDataQoS(),
             [this](const sensor_msgs::msg::Image::SharedPtr msg){
-                std::lock_guard<std::mutex> lk(image_mutex_);
-                last_image_ = msg;
-                last_image_stamp_ = msg->header.stamp;
+                std::lock_guard<std::mutex> lk(image_cam2_mutex_);
+                last_image_cam2_ = msg;
             });
-        // Digit 触觉传感器图像（只取 raw 帧，不开 GUI）
-        digit_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
-            "/digit/image_raw", rclcpp::SensorDataQoS(),
+        // DIGIT 1：D20583
+        digit_D20583_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
+            "/digit/D20583/image_raw", rclcpp::SensorDataQoS(),
             [this](const sensor_msgs::msg::Image::SharedPtr msg){
-            std::lock_guard<std::mutex> lk(digit_image_mutex_);
-            last_digit_image_ = msg;
+                std::lock_guard<std::mutex> lk(digit_D20583_mutex_);
+                last_digit_D20583_image_ = msg;
+            });
+
+        // DIGIT 2：D20584
+        digit_D20584_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
+            "/digit/D20584/image_raw", rclcpp::SensorDataQoS(),
+            [this](const sensor_msgs::msg::Image::SharedPtr msg){
+                std::lock_guard<std::mutex> lk(digit_D20584_mutex_);
+                last_digit_D20584_image_ = msg;
             });
 
         // 创建 TF broadcaster
@@ -544,8 +561,8 @@ private:
         }
 
         // 应用 90 度旋转
-        delta_pos = R_z_90_cw_ * delta_pos;
-        delta_rot = R_z_90_cw_ * delta_rot;
+        delta_pos = R_z_90_cw_ * R_z_90_cw_ * delta_pos;
+        delta_rot = R_z_90_cw_ * R_z_90_cw_ * delta_rot;
     }
 
     KDL::Frame eigenToKDL(const Eigen::Vector3d& pos, const Eigen::Quaterniond& quat) {
@@ -1062,7 +1079,6 @@ private:
         logger_running_ = true;
 
         // 1) 生成运行目录（带时间戳）
-        // 例： gen3_logs/run_2025-10-17_15-32-10/
         const auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
         std::tm tm_buf{};
         localtime_r(&t, &tm_buf);
@@ -1072,13 +1088,19 @@ private:
                     tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
 
         run_dir_ = "gen3_logs/run_" + std::string(stamp);
-        images_dir_ = run_dir_ + "/images";
 
-        std::filesystem::create_directories(images_dir_);
+        // 两路相机
+        images_cam1_dir_ = run_dir_ + "/images_cam1";
+        images_cam2_dir_ = run_dir_ + "/images_cam2";
+        std::filesystem::create_directories(images_cam1_dir_);
+        std::filesystem::create_directories(images_cam2_dir_);
 
-        // Digit 图像目录与相机目录并列
-        digit_images_dir_ = run_dir_ + "/digit_images";
-        std::filesystem::create_directories(digit_images_dir_);
+        // 两路 DIGIT
+        digit_images_D20583_dir_ = run_dir_ + "/digit_images/D20583";
+        digit_images_D20584_dir_ = run_dir_ + "/digit_images/D20584";
+        std::filesystem::create_directories(run_dir_ + "/digit_images");
+        std::filesystem::create_directories(digit_images_D20583_dir_);
+        std::filesystem::create_directories(digit_images_D20584_dir_);
 
         // 2) 打开 CSV（带表头）
         const std::string csv_path = run_dir_ + "/joint_gripper_log.csv";
@@ -1090,84 +1112,151 @@ private:
         }
 
         csv_ << "timestamp_s";
-        for (int i = 0; i < num_joints_; ++i) csv_ << ",joint" << i << "_deg";
-        csv_ << ",gripper_0to1,image_file,digit_image_file\n";
+        for (int i = 0; i < num_joints_; ++i) csv_ << ",current_joint" << i << "_deg";
+        csv_ << ",current_gripper_0to1";
+        for (int i = 0; i < num_joints_; ++i) csv_ << ",target_joint" << i << "_deg";
+        csv_ << ",target_gripper_0to1";
+        csv_ << ",cam1_image_file,cam2_image_file,digit_D20583_file,digit_D20584_file\n";
         csv_.flush();
 
-        // 3) 50Hz 循环
-        const auto dt = std::chrono::milliseconds(20);
-        auto last_flush = std::chrono::steady_clock::now();
-        while (!shutdown_requested_ && !g_shutdown_requested && rclcpp::ok()) {
-            const auto now = std::chrono::steady_clock::now();
-            const double ts = std::chrono::duration<double>(now - start_time_).count();
+        // 3) 50Hz 精准循环
+        const auto period = std::chrono::milliseconds(20);  // 50 Hz
+        auto next_tick = std::chrono::steady_clock::now();
+        auto last_flush = next_tick;
 
-            // 复制当前状态
-            std::vector<float> joints_copy(num_joints_);
-            float grip_copy = 0.0f;
+        while (!shutdown_requested_ && !g_shutdown_requested && rclcpp::ok()) {
+            next_tick += period;
+
+            // —— 生成统一时间戳（基于 start_time_）——
+            const auto now = std::chrono::steady_clock::now();
+            const double timestamp_s = std::chrono::duration<double>(now - start_time_).count();
+            const uint64_t timestamp_us =
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now - start_time_).count());
+
+            // --- 拷贝关节与夹爪状态（current + target） ---
+            std::vector<float> joints_current_copy, joints_target_copy;
+            float grip_current_copy = 0.0f, grip_target_copy = 0.0f;
             {
                 std::lock_guard<std::mutex> lk(state_mutex_);
-                joints_copy = current_joints_;
-                grip_copy = current_gripper_;
+                joints_current_copy = current_joints_;
+                joints_target_copy  = target_joints_;
+                grip_current_copy   = current_gripper_;
+                grip_target_copy    = target_gripper_;
             }
 
-            std::string img_file_rel = "";
-            std::string digit_img_file_rel = "";
-            {
-                std::lock_guard<std::mutex> lk(image_mutex_);
-                if (last_image_) {
-                    // 用系统时间戳保证文件名唯一
-                    const auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::system_clock::now().time_since_epoch()).count();
-                    img_file_rel = "images/color_" + std::to_string(now_us) + ".png";
-                    const std::string img_path = run_dir_ + "/" + img_file_rel;
+            // ========== 统一时间戳的四路图像保存 ==========
+            // 规则：若该路本周期没有可用图像，则复用上一帧文件名（保持严格对齐）
+            std::string cam1_file_rel = last_cam1_file_rel_;
+            std::string cam2_file_rel = last_cam2_file_rel_;
+            std::string digit_20583_file_rel = last_digit_20583_file_rel_;
+            std::string digit_20584_file_rel = last_digit_20584_file_rel_;
 
+            // CAM1
+            {
+                std::lock_guard<std::mutex> lk(image_cam1_mutex_);
+                if (last_image_cam1_) {
+                    const std::string rel = "images_cam1/color_" + std::to_string(timestamp_us) + ".png";
+                    const std::string img_path = run_dir_ + "/" + rel;
                     try {
-                        auto cv_ptr = cv_bridge::toCvCopy(last_image_, last_image_->encoding);
-                        if (!cv::imwrite(img_path, cv_ptr->image)) {
-                            RCLCPP_WARN(this->get_logger(), "Failed to write image: %s", img_path.c_str());
-                            img_file_rel.clear();
+                        auto cv_ptr = cv_bridge::toCvCopy(last_image_cam1_, last_image_cam1_->encoding);
+                        cv::Mat resized;
+                        cv::resize(cv_ptr->image, resized, cv::Size(224,224), 0, 0, cv::INTER_AREA);
+                        if (cv::imwrite(img_path, resized)) {
+                            cam1_file_rel = rel;
+                            last_cam1_file_rel_ = rel;
                         }
                     } catch (const std::exception& e) {
-                        RCLCPP_WARN(this->get_logger(), "cv_bridge/imwrite error: %s", e.what());
-                        img_file_rel.clear();
+                        RCLCPP_WARN(this->get_logger(), "CAM1 write error: %s", e.what());
                     }
                 }
             }
 
-            // 保存 Digit 帧（与相机并列目录）
+            // CAM2
             {
-            std::lock_guard<std::mutex> lk(digit_image_mutex_);
-            if (last_digit_image_) {
-                const auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
-                digit_img_file_rel = "digit_images/digit_" + std::to_string(now_us) + ".png";
-                const std::string digit_img_path = run_dir_ + "/" + digit_img_file_rel;
-                try {
-                // 使用原始编码保存（优先保持单通道/彩色一致性）
-                auto cv_ptr = cv_bridge::toCvCopy(*last_digit_image_, last_digit_image_->encoding);
-                cv::imwrite(digit_img_path, cv_ptr->image);
-                } catch (const std::exception& e) {
-                RCLCPP_WARN(this->get_logger(), "Failed to save Digit image: %s", e.what());
-                digit_img_file_rel.clear();
+                std::lock_guard<std::mutex> lk(image_cam2_mutex_);
+                if (last_image_cam2_) {
+                    const std::string rel = "images_cam2/color_" + std::to_string(timestamp_us) + ".png";
+                    const std::string img_path = run_dir_ + "/" + rel;
+                    try {
+                        auto cv_ptr = cv_bridge::toCvCopy(last_image_cam2_, last_image_cam2_->encoding);
+                        cv::Mat resized;
+                        cv::resize(cv_ptr->image, resized, cv::Size(224,224), 0, 0, cv::INTER_AREA);
+                        if (cv::imwrite(img_path, resized)) {
+                            cam2_file_rel = rel;
+                            last_cam2_file_rel_ = rel;
+                        }
+                    } catch (const std::exception& e) {
+                        RCLCPP_WARN(this->get_logger(), "CAM2 write error: %s", e.what());
+                    }
                 }
             }
+
+            // DIGIT D20583
+            {
+                std::lock_guard<std::mutex> lk(digit_D20583_mutex_);
+                if (last_digit_D20583_image_) {
+                    const std::string rel = "digit_images/D20583/digit_" + std::to_string(timestamp_us) + ".png";
+                    const std::string img_path = run_dir_ + "/" + rel;
+                    try {
+                        auto cv_ptr = cv_bridge::toCvCopy(last_digit_D20583_image_, last_digit_D20583_image_->encoding);
+                        if (cv::imwrite(img_path, cv_ptr->image)) {
+                            digit_20583_file_rel = rel;
+                            last_digit_20583_file_rel_ = rel;
+                        }
+                    } catch (const std::exception& e) {
+                        RCLCPP_WARN(this->get_logger(), "DIGIT D20583 write error: %s", e.what());
+                    }
+                }
             }
 
+            // DIGIT D20584
+            {
+                std::lock_guard<std::mutex> lk(digit_D20584_mutex_);
+                if (last_digit_D20584_image_) {
+                    const std::string rel = "digit_images/D20584/digit_" + std::to_string(timestamp_us) + ".png";
+                    const std::string img_path = run_dir_ + "/" + rel;
+                    try {
+                        auto cv_ptr = cv_bridge::toCvCopy(last_digit_D20584_image_, last_digit_D20584_image_->encoding);
+                        if (cv::imwrite(img_path, cv_ptr->image)) {
+                            digit_20584_file_rel = rel;
+                            last_digit_20584_file_rel_ = rel;
+                        }
+                    } catch (const std::exception& e) {
+                        RCLCPP_WARN(this->get_logger(), "DIGIT D20584 write error: %s", e.what());
+                    }
+                }
+            }
 
-            // 写一行 CSV
-            csv_ << std::fixed << std::setprecision(6) << ts;
-            for (float deg : joints_copy) csv_ << "," << deg;
-            csv_ << "," << grip_copy << "," << img_file_rel << "," << digit_img_file_rel << "\n";
+            // ========== 写入 CSV（严格以统一时间戳对齐） ==========
+            csv_ << std::fixed << std::setprecision(6) << timestamp_s;
+            for (float deg : joints_current_copy) csv_ << "," << deg;
+            csv_ << "," << grip_current_copy;
+            for (float deg : joints_target_copy)  csv_ << "," << deg;
+            csv_ << "," << grip_target_copy;
+            csv_ << "," << cam1_file_rel
+                << "," << cam2_file_rel
+                << "," << digit_20583_file_rel
+                << "," << digit_20584_file_rel
+                << "\n";
 
-            // 定期 flush，避免掉电丢数据
-            if (now - last_flush > std::chrono::seconds(1)) {
+            // 每秒 flush，防止异常掉电丢数据
+            if (std::chrono::steady_clock::now() - last_flush > std::chrono::seconds(1)) {
                 csv_.flush();
-                last_flush = now;
+                last_flush = std::chrono::steady_clock::now();
             }
 
-            std::this_thread::sleep_for(dt);
+            // —— 精准定时：若提前则 sleep_until，若滞后则立即进入下一周期（不再额外 sleep）——
+            const auto now2 = std::chrono::steady_clock::now();
+            if (now2 < next_tick) {
+                std::this_thread::sleep_until(next_tick);
+            } else {
+                // 滞后：这里可按需统计/打印，但不打断 50Hz 的绝对时标
+                // RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                //     "Logger overrun by %.2f ms", std::chrono::duration<double,std::milli>(now2 - next_tick).count());
+            }
         }
 
+        // 收尾
         csv_.flush();
         csv_.close();
         logger_running_ = false;
@@ -1248,24 +1337,38 @@ private:
     std::thread data_logger_thread_;
     std::atomic<bool> logger_running_{false};
 
-    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr color_sub_;
-    std::mutex image_mutex_;
-    sensor_msgs::msg::Image::SharedPtr last_image_;
-    rclcpp::Time last_image_stamp_;
-    rclcpp::Time last_saved_image_stamp_;
-
-    // ---- Digit 触觉相机图像 ----
-    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr digit_sub_;
-    std::mutex digit_image_mutex_;
-    sensor_msgs::msg::Image::SharedPtr last_digit_image_;
-
-    // 目录：相机与 Digit 并列
-    std::string digit_images_dir_;
-
     // Frame 状态（受 frame_mutex_ 保护）
     std::mutex frame_mutex_;
     KDL::Frame current_ee_frame_;
     KDL::Frame target_ee_frame_;
+
+    // ---------- 新增：两路相机 ----------
+    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr color_sub_cam1_;
+    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr color_sub_cam2_;
+    sensor_msgs::msg::Image::SharedPtr last_image_cam1_;
+    sensor_msgs::msg::Image::SharedPtr last_image_cam2_;
+    std::mutex image_cam1_mutex_;
+    std::mutex image_cam2_mutex_;
+
+    // ---------- 新增：两路 DIGIT ----------
+    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr digit_D20583_sub_;
+    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr digit_D20584_sub_;
+    sensor_msgs::msg::Image::SharedPtr last_digit_D20583_image_;
+    sensor_msgs::msg::Image::SharedPtr last_digit_D20584_image_;
+    std::mutex digit_D20583_mutex_;
+    std::mutex digit_D20584_mutex_;
+
+    // ---------- 新增：目录 ----------
+    std::string images_cam1_dir_;
+    std::string images_cam2_dir_;
+    std::string digit_images_D20583_dir_;
+    std::string digit_images_D20584_dir_;
+
+    // ---- 上一帧各路图像的相对路径（缺帧时复用）----
+    std::string last_cam1_file_rel_;
+    std::string last_cam2_file_rel_;
+    std::string last_digit_20583_file_rel_;
+    std::string last_digit_20584_file_rel_;
 
     // 控制状态
     std::atomic<bool> is_active_;

@@ -108,11 +108,14 @@ public:
           gripper_control_mode_(0),  // 0: trigger mode, 1: button mode
           gripper_step_value_(0.1f),
           gripper_button_repeat_interval_(0.1),
-          data_logging_enabled_(false),  // 默认关闭数据记录
+          data_logging_enabled_(true),  // 修改：默认开启数据记录功能，但不立即开始记录
           overrun_time_ms_(0.0),  // 超时补偿时间（毫秒）
           catchup_rate_ms_(30.0),  // 追赶速率（毫秒/循环）
           max_pose_history_(1000),  // 最大历史记录数
-          xr_data_rate_ms_(5.0)  // XR数据频率（5ms = 200Hz）
+          xr_data_rate_ms_(5.0),  // XR数据频率（5ms = 200Hz）
+          xr_left_trigger_(0.0f),  // 新增：左手扳机值
+          trigger_trig_(false),    // 新增：扳机触发状态  
+          log_enable_(false)       // 新增：记录使能状态
     {
         // 初始化状态向量
         target_joints_.resize(num_joints_, 0.0f);
@@ -153,6 +156,11 @@ public:
         trigger_sub_ = this->create_subscription<std_msgs::msg::Float32>(
             "xr/right_trigger", 10,
             std::bind(&Gen3XRTeleopNode::triggerCallback, this, std::placeholders::_1));
+            
+        // 新增：左手扳机订阅器
+        left_trigger_sub_ = this->create_subscription<std_msgs::msg::Float32>(
+            "xr/left_trigger", 10,
+            std::bind(&Gen3XRTeleopNode::leftTriggerCallback, this, std::placeholders::_1));
 
         pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
             "xr/right_controller_pose", 10,
@@ -208,9 +216,10 @@ public:
         tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
 
         RCLCPP_INFO(this->get_logger(), "Gen3 XR Teleop Node created");
-        RCLCPP_INFO(this->get_logger(), "Data logging: %s",
-                   data_logging_enabled_ ? "ENABLED" : "DISABLED");
-        RCLCPP_INFO(this->get_logger(), "Log file: %s", log_file_path_.c_str());
+        RCLCPP_INFO(this->get_logger(), "Data logging: ENABLED with left trigger control");
+        RCLCPP_INFO(this->get_logger(), "  - Press left trigger to START/STOP recording");
+        RCLCPP_INFO(this->get_logger(), "  - Each recording creates a new folder");
+        RCLCPP_INFO(this->get_logger(), "Log file base: %s", log_file_path_.c_str());
         RCLCPP_INFO(this->get_logger(), "Overrun compensation: catchup_rate=%.1fms/cycle", catchup_rate_ms_);
         RCLCPP_INFO(this->get_logger(), "Gripper control:");
         RCLCPP_INFO(this->get_logger(), "  - Button A: Toggle control mode (Trigger/Button)");
@@ -252,7 +261,7 @@ public:
         // 启动控制线程（高优先级）
         std::thread control_thread(&Gen3XRTeleopNode::controlThread, this);
 
-        // 启动数据保存线程（50Hz）
+        // 启动数据保存线程（15Hz）
         std::thread logger_thread(&Gen3XRTeleopNode::dataLoggerThread, this);
 
         // 设置控制线程优先级（Linux）
@@ -279,7 +288,7 @@ public:
         if (control_thread.joinable()) {
             control_thread.join();
         }
-        if (logger_thread.joinable()) logger_thread.join();   // <--- 新增
+        if (logger_thread.joinable()) logger_thread.join();
 
         // 保存数据
         if (data_logging_enabled_) {
@@ -312,6 +321,31 @@ private:
     void triggerCallback(const std_msgs::msg::Float32::SharedPtr msg) {
         std::lock_guard<std::mutex> lock(xr_data_mutex_);
         xr_right_trigger_ = msg->data;
+    }
+    
+    // 新增：左手扳机回调函数
+    void leftTriggerCallback(const std_msgs::msg::Float32::SharedPtr msg) {
+        std::lock_guard<std::mutex> lock(xr_data_mutex_);
+        float prev_value = xr_left_trigger_;
+        xr_left_trigger_ = msg->data;
+        
+        // 处理扳机状态切换
+        bool prev_trigger_trig = trigger_trig_;
+        
+        if (!trigger_trig_ && xr_left_trigger_ > 0.9f) {
+            // 扳机按下
+            trigger_trig_ = true;
+        } else if (trigger_trig_ && xr_left_trigger_ < 0.5f) {
+            // 扳机松开
+            trigger_trig_ = false;
+        }
+        
+        // 检测从false变为true（按下瞬间），切换log_enable_
+        if (!prev_trigger_trig && trigger_trig_) {
+            log_enable_ = !log_enable_;
+            RCLCPP_INFO(this->get_logger(), "Left trigger pressed: Recording %s", 
+                       log_enable_ ? "STARTED" : "STOPPED");
+        }
     }
 
     void poseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
@@ -659,8 +693,8 @@ private:
             return;
         }
 
-        // 写入表头
-        file << "timestamp";
+        // 写入表头 - 修改为index
+        file << "index";
         for (int i = 0; i < num_joints_; ++i) {
             file << ",current_j" << i
                  << ",target_j" << i
@@ -670,8 +704,9 @@ private:
 
         // 写入数据
         file << std::fixed << std::setprecision(6);
+        int index = 0;
         for (const auto& data : logged_data_) {
-            file << data.timestamp;
+            file << index++;
             for (int i = 0; i < num_joints_; ++i) {
                 file << "," << data.current_positions[i]
                      << "," << data.target_positions[i]
@@ -1075,191 +1110,219 @@ private:
         RCLCPP_INFO(this->get_logger(), "Control thread stopped");
     }
 
+    // 修改后的dataLoggerThread函数
     void dataLoggerThread() {
         logger_running_ = true;
-
-        // 1) 生成运行目录（带时间戳）
-        const auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-        std::tm tm_buf{};
-        localtime_r(&t, &tm_buf);
-        char stamp[32];
-        std::snprintf(stamp, sizeof(stamp), "%04d-%02d-%02d_%02d-%02d-%02d",
-                    tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
-                    tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
-
-        run_dir_ = "gen3_logs/run_" + std::string(stamp);
-
-        // 两路相机
-        images_cam1_dir_ = run_dir_ + "/images_cam1";
-        images_cam2_dir_ = run_dir_ + "/images_cam2";
-        std::filesystem::create_directories(images_cam1_dir_);
-        std::filesystem::create_directories(images_cam2_dir_);
-
-        // 两路 DIGIT
-        digit_images_D20583_dir_ = run_dir_ + "/digit_images/D20583";
-        digit_images_D20584_dir_ = run_dir_ + "/digit_images/D20584";
-        std::filesystem::create_directories(run_dir_ + "/digit_images");
-        std::filesystem::create_directories(digit_images_D20583_dir_);
-        std::filesystem::create_directories(digit_images_D20584_dir_);
-
-        // 2) 打开 CSV（带表头）
-        const std::string csv_path = run_dir_ + "/joint_gripper_log.csv";
-        csv_.open(csv_path, std::ios::out);
-        if (!csv_.is_open()) {
-            RCLCPP_ERROR(this->get_logger(), "Failed to open CSV: %s", csv_path.c_str());
-            logger_running_ = false;
-            return;
-        }
-
-        csv_ << "timestamp_s";
-        for (int i = 0; i < num_joints_; ++i) csv_ << ",current_joint" << i << "_deg";
-        csv_ << ",current_gripper_0to1";
-        for (int i = 0; i < num_joints_; ++i) csv_ << ",target_joint" << i << "_deg";
-        csv_ << ",target_gripper_0to1";
-        csv_ << ",cam1_image_file,cam2_image_file,digit_D20583_file,digit_D20584_file\n";
-        csv_.flush();
-
-        // 3) 15Hz 精准循环
-        const auto period = std::chrono::microseconds(66667);  // 15 Hz
-        auto next_tick = std::chrono::steady_clock::now();
-        auto last_flush = next_tick;
-
+        RCLCPP_INFO(this->get_logger(), "Data logger thread started, waiting for trigger...");
+        
+        // 外层循环：等待log_enable_变为true
         while (!shutdown_requested_ && !g_shutdown_requested && rclcpp::ok()) {
-            next_tick += period;
+            // 等待log_enable_变为true
+            while (!log_enable_ && !shutdown_requested_ && !g_shutdown_requested && rclcpp::ok()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            
+            if (shutdown_requested_ || g_shutdown_requested || !rclcpp::ok()) {
+                break;
+            }
+            
+            // 开始新的记录会话
+            RCLCPP_INFO(this->get_logger(), "Starting new recording session...");
+            
+            // 1) 生成运行目录（带时间戳）
+            const auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+            std::tm tm_buf{};
+            localtime_r(&t, &tm_buf);
+            char stamp[32];
+            std::snprintf(stamp, sizeof(stamp), "%04d-%02d-%02d_%02d-%02d-%02d",
+                        tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
+                        tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
 
-            // —— 生成统一时间戳（基于 start_time_）——
-            const auto now = std::chrono::steady_clock::now();
-            const double timestamp_s = std::chrono::duration<double>(now - start_time_).count();
-            const uint64_t timestamp_us =
-                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now - start_time_).count());
+            run_dir_ = "gen3_logs/run_" + std::string(stamp);
 
-            // --- 拷贝关节与夹爪状态（current + target） ---
-            std::vector<float> joints_current_copy, joints_target_copy;
-            float grip_current_copy = 0.0f, grip_target_copy = 0.0f;
-            {
-                std::lock_guard<std::mutex> lk(state_mutex_);
-                joints_current_copy = current_joints_;
-                joints_target_copy  = target_joints_;
-                grip_current_copy   = current_gripper_;
-                grip_target_copy    = target_gripper_;
+            // 两路相机
+            images_cam1_dir_ = run_dir_ + "/images_cam1";
+            images_cam2_dir_ = run_dir_ + "/images_cam2";
+            std::filesystem::create_directories(images_cam1_dir_);
+            std::filesystem::create_directories(images_cam2_dir_);
+
+            // 两路 DIGIT
+            digit_images_D20583_dir_ = run_dir_ + "/digit_images/D20583";
+            digit_images_D20584_dir_ = run_dir_ + "/digit_images/D20584";
+            std::filesystem::create_directories(run_dir_ + "/digit_images");
+            std::filesystem::create_directories(digit_images_D20583_dir_);
+            std::filesystem::create_directories(digit_images_D20584_dir_);
+
+            // 2) 打开 CSV（带表头）
+            const std::string csv_path = run_dir_ + "/joint_gripper_log.csv";
+            csv_.open(csv_path, std::ios::out);
+            if (!csv_.is_open()) {
+                RCLCPP_ERROR(this->get_logger(), "Failed to open CSV: %s", csv_path.c_str());
+                continue;  // 跳过本次记录
             }
 
-            // ========== 统一时间戳的四路图像保存 ==========
-            // 规则：若该路本周期没有可用图像，则复用上一帧文件名（保持严格对齐）
-            std::string cam1_file_rel = last_cam1_file_rel_;
-            std::string cam2_file_rel = last_cam2_file_rel_;
-            std::string digit_20583_file_rel = last_digit_20583_file_rel_;
-            std::string digit_20584_file_rel = last_digit_20584_file_rel_;
+            // 修改表头：使用index替代timestamp
+            csv_ << "index";
+            for (int i = 0; i < num_joints_; ++i) csv_ << ",current_joint" << i << "_deg";
+            csv_ << ",current_gripper_0to1";
+            for (int i = 0; i < num_joints_; ++i) csv_ << ",target_joint" << i << "_deg";
+            csv_ << ",target_gripper_0to1";
+            csv_ << ",cam1_image_file,cam2_image_file,digit_D20583_file,digit_D20584_file\n";
+            csv_.flush();
 
-            // CAM1
-            {
-                std::lock_guard<std::mutex> lk(image_cam1_mutex_);
-                if (last_image_cam1_) {
-                    const std::string rel = "images_cam1/color_" + std::to_string(timestamp_us) + ".png";
-                    const std::string img_path = run_dir_ + "/" + rel;
-                    try {
-                        auto cv_ptr = cv_bridge::toCvCopy(last_image_cam1_, last_image_cam1_->encoding);
-                        cv::Mat resized;
-                        cv::resize(cv_ptr->image, resized, cv::Size(224,224), 0, 0, cv::INTER_AREA);
-                        if (cv::imwrite(img_path, resized)) {
-                            cam1_file_rel = rel;
-                            last_cam1_file_rel_ = rel;
+            // 初始化索引
+            int data_index = 0;
+            
+            // 重置上一帧文件名
+            last_cam1_file_rel_.clear();
+            last_cam2_file_rel_.clear();
+            last_digit_20583_file_rel_.clear();
+            last_digit_20584_file_rel_.clear();
+
+            // 3) 15Hz 精准循环
+            const auto period = std::chrono::microseconds(66667);  // 15 Hz
+            auto next_tick = std::chrono::steady_clock::now();
+            auto last_flush = next_tick;
+            
+            RCLCPP_INFO(this->get_logger(), "Recording to: %s", run_dir_.c_str());
+
+            // 内层循环：记录数据，直到log_enable_变为false
+            while (log_enable_ && !shutdown_requested_ && !g_shutdown_requested && rclcpp::ok()) {
+                next_tick += period;
+
+                // —— 生成统一时间戳（用于文件名）——
+                const auto now = std::chrono::steady_clock::now();
+                const uint64_t timestamp_us =
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now - start_time_).count());
+
+                // --- 拷贝关节与夹爪状态（current + target） ---
+                std::vector<float> joints_current_copy, joints_target_copy;
+                float grip_current_copy = 0.0f, grip_target_copy = 0.0f;
+                {
+                    std::lock_guard<std::mutex> lk(state_mutex_);
+                    joints_current_copy = current_joints_;
+                    joints_target_copy  = target_joints_;
+                    grip_current_copy   = current_gripper_;
+                    grip_target_copy    = target_gripper_;
+                }
+
+                // ========== 统一时间戳的四路图像保存 ==========
+                // 规则：若该路本周期没有可用图像，则复用上一帧文件名（保持严格对齐）
+                std::string cam1_file_rel = last_cam1_file_rel_;
+                std::string cam2_file_rel = last_cam2_file_rel_;
+                std::string digit_20583_file_rel = last_digit_20583_file_rel_;
+                std::string digit_20584_file_rel = last_digit_20584_file_rel_;
+
+                // CAM1
+                {
+                    std::lock_guard<std::mutex> lk(image_cam1_mutex_);
+                    if (last_image_cam1_) {
+                        const std::string rel = "images_cam1/color_" + std::to_string(timestamp_us) + ".png";
+                        const std::string img_path = run_dir_ + "/" + rel;
+                        try {
+                            auto cv_ptr = cv_bridge::toCvCopy(last_image_cam1_, last_image_cam1_->encoding);
+                            cv::Mat resized;
+                            cv::resize(cv_ptr->image, resized, cv::Size(224,224), 0, 0, cv::INTER_AREA);
+                            if (cv::imwrite(img_path, resized)) {
+                                cam1_file_rel = rel;
+                                last_cam1_file_rel_ = rel;
+                            }
+                        } catch (const std::exception& e) {
+                            RCLCPP_WARN(this->get_logger(), "CAM1 write error: %s", e.what());
                         }
-                    } catch (const std::exception& e) {
-                        RCLCPP_WARN(this->get_logger(), "CAM1 write error: %s", e.what());
                     }
                 }
-            }
 
-            // CAM2
-            {
-                std::lock_guard<std::mutex> lk(image_cam2_mutex_);
-                if (last_image_cam2_) {
-                    const std::string rel = "images_cam2/color_" + std::to_string(timestamp_us) + ".png";
-                    const std::string img_path = run_dir_ + "/" + rel;
-                    try {
-                        auto cv_ptr = cv_bridge::toCvCopy(last_image_cam2_, last_image_cam2_->encoding);
-                        cv::Mat resized;
-                        cv::resize(cv_ptr->image, resized, cv::Size(224,224), 0, 0, cv::INTER_AREA);
-                        if (cv::imwrite(img_path, resized)) {
-                            cam2_file_rel = rel;
-                            last_cam2_file_rel_ = rel;
+                // CAM2
+                {
+                    std::lock_guard<std::mutex> lk(image_cam2_mutex_);
+                    if (last_image_cam2_) {
+                        const std::string rel = "images_cam2/color_" + std::to_string(timestamp_us) + ".png";
+                        const std::string img_path = run_dir_ + "/" + rel;
+                        try {
+                            auto cv_ptr = cv_bridge::toCvCopy(last_image_cam2_, last_image_cam2_->encoding);
+                            cv::Mat resized;
+                            cv::resize(cv_ptr->image, resized, cv::Size(224,224), 0, 0, cv::INTER_AREA);
+                            if (cv::imwrite(img_path, resized)) {
+                                cam2_file_rel = rel;
+                                last_cam2_file_rel_ = rel;
+                            }
+                        } catch (const std::exception& e) {
+                            RCLCPP_WARN(this->get_logger(), "CAM2 write error: %s", e.what());
                         }
-                    } catch (const std::exception& e) {
-                        RCLCPP_WARN(this->get_logger(), "CAM2 write error: %s", e.what());
                     }
                 }
-            }
 
-            // DIGIT D20583
-            {
-                std::lock_guard<std::mutex> lk(digit_D20583_mutex_);
-                if (last_digit_D20583_image_) {
-                    const std::string rel = "digit_images/D20583/digit_" + std::to_string(timestamp_us) + ".png";
-                    const std::string img_path = run_dir_ + "/" + rel;
-                    try {
-                        auto cv_ptr = cv_bridge::toCvCopy(last_digit_D20583_image_, last_digit_D20583_image_->encoding);
-                        if (cv::imwrite(img_path, cv_ptr->image)) {
-                            digit_20583_file_rel = rel;
-                            last_digit_20583_file_rel_ = rel;
+                // DIGIT D20583
+                {
+                    std::lock_guard<std::mutex> lk(digit_D20583_mutex_);
+                    if (last_digit_D20583_image_) {
+                        const std::string rel = "digit_images/D20583/digit_" + std::to_string(timestamp_us) + ".png";
+                        const std::string img_path = run_dir_ + "/" + rel;
+                        try {
+                            auto cv_ptr = cv_bridge::toCvCopy(last_digit_D20583_image_, last_digit_D20583_image_->encoding);
+                            if (cv::imwrite(img_path, cv_ptr->image)) {
+                                digit_20583_file_rel = rel;
+                                last_digit_20583_file_rel_ = rel;
+                            }
+                        } catch (const std::exception& e) {
+                            RCLCPP_WARN(this->get_logger(), "DIGIT D20583 write error: %s", e.what());
                         }
-                    } catch (const std::exception& e) {
-                        RCLCPP_WARN(this->get_logger(), "DIGIT D20583 write error: %s", e.what());
                     }
                 }
-            }
 
-            // DIGIT D20584
-            {
-                std::lock_guard<std::mutex> lk(digit_D20584_mutex_);
-                if (last_digit_D20584_image_) {
-                    const std::string rel = "digit_images/D20584/digit_" + std::to_string(timestamp_us) + ".png";
-                    const std::string img_path = run_dir_ + "/" + rel;
-                    try {
-                        auto cv_ptr = cv_bridge::toCvCopy(last_digit_D20584_image_, last_digit_D20584_image_->encoding);
-                        if (cv::imwrite(img_path, cv_ptr->image)) {
-                            digit_20584_file_rel = rel;
-                            last_digit_20584_file_rel_ = rel;
+                // DIGIT D20584
+                {
+                    std::lock_guard<std::mutex> lk(digit_D20584_mutex_);
+                    if (last_digit_D20584_image_) {
+                        const std::string rel = "digit_images/D20584/digit_" + std::to_string(timestamp_us) + ".png";
+                        const std::string img_path = run_dir_ + "/" + rel;
+                        try {
+                            auto cv_ptr = cv_bridge::toCvCopy(last_digit_D20584_image_, last_digit_D20584_image_->encoding);
+                            if (cv::imwrite(img_path, cv_ptr->image)) {
+                                digit_20584_file_rel = rel;
+                                last_digit_20584_file_rel_ = rel;
+                            }
+                        } catch (const std::exception& e) {
+                            RCLCPP_WARN(this->get_logger(), "DIGIT D20584 write error: %s", e.what());
                         }
-                    } catch (const std::exception& e) {
-                        RCLCPP_WARN(this->get_logger(), "DIGIT D20584 write error: %s", e.what());
                     }
                 }
-            }
 
-            // ========== 写入 CSV（严格以统一时间戳对齐） ==========
-            csv_ << std::fixed << std::setprecision(6) << timestamp_s;
-            for (float deg : joints_current_copy) csv_ << "," << deg;
-            csv_ << "," << grip_current_copy;
-            for (float deg : joints_target_copy)  csv_ << "," << deg;
-            csv_ << "," << grip_target_copy;
-            csv_ << "," << cam1_file_rel
-                << "," << cam2_file_rel
-                << "," << digit_20583_file_rel
-                << "," << digit_20584_file_rel
-                << "\n";
+                // ========== 写入 CSV（使用index） ==========
+                csv_ << data_index++;  // 使用递增的索引
+                for (float deg : joints_current_copy) csv_ << "," << deg;
+                csv_ << "," << grip_current_copy;
+                for (float deg : joints_target_copy)  csv_ << "," << deg;
+                csv_ << "," << grip_target_copy;
+                csv_ << "," << cam1_file_rel
+                    << "," << cam2_file_rel
+                    << "," << digit_20583_file_rel
+                    << "," << digit_20584_file_rel
+                    << "\n";
 
-            // 每秒 flush，防止异常掉电丢数据
-            if (std::chrono::steady_clock::now() - last_flush > std::chrono::seconds(1)) {
-                csv_.flush();
-                last_flush = std::chrono::steady_clock::now();
-            }
+                // 每秒 flush，防止异常掉电丢数据
+                if (std::chrono::steady_clock::now() - last_flush > std::chrono::seconds(1)) {
+                    csv_.flush();
+                    last_flush = std::chrono::steady_clock::now();
+                }
 
-            // —— 精准定时：若提前则 sleep_until，若滞后则立即进入下一周期（不再额外 sleep）——
-            const auto now2 = std::chrono::steady_clock::now();
-            if (now2 < next_tick) {
-                std::this_thread::sleep_until(next_tick);
-            } else {
-                // 滞后：这里可按需统计/打印，但不打断 50Hz 的绝对时标
-                // RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                //     "Logger overrun by %.2f ms", std::chrono::duration<double,std::milli>(now2 - next_tick).count());
+                // —— 精准定时：若提前则 sleep_until，若滞后则立即进入下一周期（不再额外 sleep）——
+                const auto now2 = std::chrono::steady_clock::now();
+                if (now2 < next_tick) {
+                    std::this_thread::sleep_until(next_tick);
+                }
             }
+            
+            // 记录结束，关闭CSV
+            csv_.flush();
+            csv_.close();
+            RCLCPP_INFO(this->get_logger(), "Recording stopped. Saved %d data points to %s", 
+                       data_index, run_dir_.c_str());
         }
 
-        // 收尾
-        csv_.flush();
-        csv_.close();
         logger_running_ = false;
+        RCLCPP_INFO(this->get_logger(), "Data logger thread stopped");
     }
 
     // ========== 成员变量 ==========
@@ -1287,6 +1350,7 @@ private:
     // ROS2 订阅器
     rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr grip_sub_;
     rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr trigger_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr left_trigger_sub_;  // 新增
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr pose_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr button_a_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr button_b_sub_;
@@ -1300,6 +1364,7 @@ private:
     std::mutex xr_data_mutex_;
     float xr_right_grip_;
     float xr_right_trigger_;
+    float xr_left_trigger_;  // 新增：左手扳机值
     std::vector<double> xr_controller_pose_;
     std::deque<PoseHistoryEntry> pose_history_;  // Pose历史队列
 
@@ -1317,6 +1382,10 @@ private:
     std::chrono::steady_clock::time_point button_x_last_trigger_time_;
     std::chrono::steady_clock::time_point button_y_last_trigger_time_;
     double gripper_button_repeat_interval_;  // 重复间隔（秒）
+    
+    // 新增：左手扳机控制状态
+    std::atomic<bool> trigger_trig_;  // 扳机触发状态
+    std::atomic<bool> log_enable_;    // 记录使能状态
 
     // 线程控制
     std::atomic<bool> shutdown_requested_;

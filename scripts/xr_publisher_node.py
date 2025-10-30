@@ -26,6 +26,7 @@ class XRPublisherNode(Node):
         # 声明可配置参数
         self.declare_parameter('publish_rate', 200.0)
         self.declare_parameter('frame_id', 'vr_origin')
+        self.declare_parameter('left_trigger_rate', 50.0)  # 新增：left_trigger发布频率参数
 
         # 初始化 XR SDK
         self._init_xr_sdk()
@@ -40,6 +41,12 @@ class XRPublisherNode(Node):
         self.right_trigger_pub = self.create_publisher(
             Float32, 
             'xr/right_trigger', 
+            10
+        )
+        
+        self.left_trigger_pub = self.create_publisher(
+            Float32,
+            'xr/left_trigger',
             10
         )
         
@@ -79,18 +86,31 @@ class XRPublisherNode(Node):
         if self.publish_rate <= 0.0:
             self.get_logger().warn('publish_rate <= 0, falling back to 200 Hz')
             self.publish_rate = 200.0
+            
+        self.left_trigger_rate = float(self.get_parameter('left_trigger_rate').value)
+        if self.left_trigger_rate <= 0.0:
+            self.get_logger().warn('left_trigger_rate <= 0, falling back to 50 Hz')
+            self.left_trigger_rate = 50.0
+            
         self.frame_id = str(self.get_parameter('frame_id').value)
         if not self.frame_id:
             self.frame_id = 'vr_origin'
 
+        # 主定时器（200Hz）
         timer_period = 1.0 / self.publish_rate
         self.timer = self.create_timer(timer_period, self.publish_callback)
         
+        # Left Trigger定时器（50Hz）
+        left_trigger_period = 1.0 / self.left_trigger_rate
+        self.left_trigger_timer = self.create_timer(left_trigger_period, self.publish_left_trigger_callback)
+        
         self.get_logger().info(f'XR Publisher Node started at {self.publish_rate}Hz')
+        self.get_logger().info(f'Left trigger publishing at {self.left_trigger_rate}Hz')
         self.get_logger().info(f'Publishing pose in frame: {self.frame_id}')
         self.get_logger().info('Publishing topics:')
         self.get_logger().info('  - /xr/right_grip (Float32)')
         self.get_logger().info('  - /xr/right_trigger (Float32)')
+        self.get_logger().info('  - /xr/left_trigger (Float32) @ 50Hz')
         self.get_logger().info('  - /xr/right_controller_pose (PoseStamped)')
         self.get_logger().info('  - /xr/button_a (Bool)')
         self.get_logger().info('  - /xr/button_b (Bool)')
@@ -106,8 +126,21 @@ class XRPublisherNode(Node):
             self.get_logger().error(f'Failed to initialize XR SDK: {str(e)}')
             raise
     
+    def publish_left_trigger_callback(self):
+        """定时器回调：发布left trigger数据（50Hz）"""
+        if not rclpy.ok():
+            return
+        try:
+            # 发布左手扳机值
+            left_trigger_msg = Float32()
+            left_trigger_msg.data = float(xrt.get_left_trigger())
+            self.left_trigger_pub.publish(left_trigger_msg)
+            
+        except Exception as e:
+            self.get_logger().error(f"Error publishing left trigger data: {str(e)}")
+    
     def publish_callback(self):
-        """定时器回调：发布所有 XR 数据"""
+        """定时器回调：发布所有其他 XR 数据（200Hz）"""
         if not rclpy.ok():
             return
         try:
@@ -189,7 +222,7 @@ def main(args=None):
     finally:
         if node is not None:
             node.destroy_node()
-        # 只在还未关闭时调用 shutdown，避免 “already called” 异常
+        # 只在还未关闭时调用 shutdown，避免 "already called" 异常
         if rclpy.ok():
             try:
                 rclpy.shutdown()

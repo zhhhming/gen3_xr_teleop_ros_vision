@@ -561,8 +561,8 @@ private:
         }
 
         // 应用 90 度旋转
-        delta_pos = R_z_90_cw_ * R_z_90_cw_ * delta_pos;
-        delta_rot = R_z_90_cw_ * R_z_90_cw_ * delta_rot;
+        delta_pos = R_z_90_cw_ * R_z_90_cw_ * R_z_90_cw_ * R_z_90_cw_ * delta_pos;
+        delta_rot = R_z_90_cw_ * R_z_90_cw_ * R_z_90_cw_ * R_z_90_cw_ * delta_rot;
     }
 
     KDL::Frame eigenToKDL(const Eigen::Vector3d& pos, const Eigen::Quaterniond& quat) {
@@ -975,7 +975,7 @@ private:
         auto last_report = std::chrono::steady_clock::now();
 
         // 期望的"最大角速度" (°/s)。可按实际需求调参或做成每关节数组。
-        const float max_step_deg  = 0.8f;
+        const float max_step_deg  = 0.6f;
 
         while (!shutdown_requested_ && !g_shutdown_requested) {
             auto loop_start = std::chrono::steady_clock::now();
@@ -1119,8 +1119,8 @@ private:
         csv_ << ",cam1_image_file,cam2_image_file,digit_D20583_file,digit_D20584_file\n";
         csv_.flush();
 
-        // 3) 50Hz 精准循环
-        const auto period = std::chrono::milliseconds(20);  // 50 Hz
+        // 3) 15Hz 精准循环
+        const auto period = std::chrono::microseconds(66667);  // 15 Hz
         auto next_tick = std::chrono::steady_clock::now();
         auto last_flush = next_tick;
 
